@@ -22,7 +22,7 @@
 #include "task.h"
 #include "main.h"
 #include "cmsis_os.h"
-
+#include "usart.h"
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 
@@ -155,7 +155,7 @@ void MX_FREERTOS_Init(void) {
 void StartDeviceTask(void *argument)
 {
   /* USER CODE BEGIN StartDeviceTask */
-	
+
   /* Infinite loop */
   for(;;)
   {
@@ -175,12 +175,20 @@ void StartDeviceTask(void *argument)
 void StartCommTask(void *argument)
 {
   /* USER CODE BEGIN StartCommTask */
-	
+  uint8_t rx_byte;
   /* Infinite loop */
   for(;;)
   {
-    comm_alive++;
-    osDelay(1000);
+
+    if (HAL_UART_Receive(&huart1, &rx_byte, 1U,20U) == HAL_OK)
+    {
+      HAL_UART_Transmit(&huart1, &rx_byte, 1U, 100U);
+      comm_alive++;
+    }
+    else
+    {
+      osDelay(1);
+    }
   }
   /* USER CODE END StartCommTask */
 }

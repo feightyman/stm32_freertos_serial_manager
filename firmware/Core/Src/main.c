@@ -69,8 +69,7 @@ int main(void)
 {
 
   /* USER CODE BEGIN 1 */
-  HAL_UART_Transmit();
-  HAL_UART
+
   /* USER CODE END 1 */
 
   /* MCU Configuration--------------------------------------------------------*/

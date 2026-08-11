@@ -22,10 +22,10 @@
 #include "task.h"
 #include "main.h"
 #include "cmsis_os.h"
-#include "usart.h"
+
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
+#include "usart.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -35,7 +35,7 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-
+#define UART_RX_DMA_BUFFER_SIZE 128U
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -47,6 +47,10 @@
 /* USER CODE BEGIN Variables */
 volatile uint32_t device_alive = 0;
 volatile uint32_t comm_alive = 0;
+
+static uint8_t uart_rx_dma_buffer[UART_RX_DMA_BUFFER_SIZE];
+static volatile uint16_t uart_rx_length = 0U;
+static volatile uint8_t uart_rx_ready = 0U;
 /* USER CODE END Variables */
 /* Definitions for DeviceTask */
 osThreadId_t DeviceTaskHandle;
@@ -175,26 +179,63 @@ void StartDeviceTask(void *argument)
 void StartCommTask(void *argument)
 {
   /* USER CODE BEGIN StartCommTask */
-  uint8_t rx_byte;
+  uint16_t echo_length;
+  HAL_StatusTypeDef rx_status;
+  rx_status = HAL_UARTEx_ReceiveToIdle_DMA(
+    &huart1,
+    uart_rx_dma_buffer,
+    UART_RX_DMA_BUFFER_SIZE
+  );
+  if (rx_status != HAL_OK)
+  {
+    Error_Handler();
+  }
+  __HAL_DMA_DISABLE_IT(huart1.hdmarx,DMA_IT_HT);
   /* Infinite loop */
   for(;;)
   {
-
-    if (HAL_UART_Receive(&huart1, &rx_byte, 1U,20U) == HAL_OK)
+    if (uart_rx_ready != 0U)
     {
-      HAL_UART_Transmit(&huart1, &rx_byte, 1U, 100U);
+      echo_length = uart_rx_length;
+      uart_rx_ready = 0U;
+      if (HAL_UART_Transmit(
+        &huart1,
+        uart_rx_dma_buffer,
+        echo_length,
+        100U
+      ) != HAL_OK)
+      {
+        Error_Handler();
+      }
+      uart_rx_length = 0U;
+
+      rx_status = HAL_UARTEx_ReceiveToIdle_DMA(
+        &huart1,
+        uart_rx_dma_buffer,
+        UART_RX_DMA_BUFFER_SIZE
+      );
+      if (rx_status != HAL_OK)
+      {
+        Error_Handler();
+      }
+      __HAL_DMA_DISABLE_IT(huart1.hdmarx, DMA_IT_HT);
       comm_alive++;
     }
     else
-    {
-      osDelay(1);
-    }
+    osDelay(1);
   }
   /* USER CODE END StartCommTask */
 }
 
 /* Private application code --------------------------------------------------*/
 /* USER CODE BEGIN Application */
-
+void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef* huart, uint16_t Size)
+{
+  if (huart->Instance == USART1)
+  {
+    uart_rx_length = Size;
+    uart_rx_ready = 1U;
+  }
+}
 /* USER CODE END Application */
 

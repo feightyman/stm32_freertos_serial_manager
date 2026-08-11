@@ -13,21 +13,28 @@ STM32 UART → DMA + IDLE → Ring Buffer → Protocol Parser
 
 ## 当前进度
 
-已完成 P0-2 基础 UART 链路验证：
+已完成基础 UART Echo 和 UART DMA + IDLE 不定长接收验证：
 
 ```text
-Python → USB-TTL → STM32 USART1 → FreeRTOS CommTask
-       ←          单字节原样回显          ←
+PC Python Test Tool
+→ CH340 USB-TTL
+→ STM32 USART1 RX
+→ DMA 批量接收
+→ Receive Event Callback
+→ FreeRTOS CommTask
+→ UART Echo
+→ Python 比较 TX 与 RX
 ```
-
-当前固件使用 HAL 阻塞式单字节收发完成回显测试。CubeMX 工程中虽然已经配置 DMA，但当前回显链路尚未使用 DMA + IDLE。
 
 已验证：
 
 - Python 可以打开串口。
 - PC 可以向 STM32 发送二进制数据。
-- STM32 可以接收并原样返回数据。
-- Python 可以比较发送数据与接收数据并输出测试结果。
+- DMA 可以将不定长数据搬入接收缓冲区。
+- Receive Event Callback 可以取得本批有效长度。
+- CommTask 可以将本批数据原样返回 PC。
+- Echo 完成后可以重新启动 DMA 接收。
+- Python 已验证 1、3、17、64 字节，结果均为 TX == RX。
 
 ## 硬件与工具
 
@@ -105,33 +112,37 @@ python -m pip install pyserial
 python tools/uart_echo_test.py COM7
 ```
 
-`COM7` 需要替换为实际的 CH340 串口号。测试程序发送三个原始字节：
+`COM7` 需要替换为实际的 CH340 串口号。测试程序在同一个串口会话中依次发送 1、3、17、64 字节，分别读取相同长度的数据并比较 TX 与 RX。
+
+四组测试均应输出 `PASS`：
 
 ```text
-01 02 03
-```
-
-成功输出：
-
-```text
-Open port: COM7
-Serial port opened
-TX: 01 02 03
-RX: 01 02 03
-PASS
+Length: 1  PASS
+Length: 3  PASS
+Length: 17 PASS
+Length: 64 PASS
 ```
 
 ## 当前实现说明
 
-`CommTask` 当前使用阻塞式 HAL 接口逐字节接收和回传数据。这种方式实现简单，适合验证串口参数、接线、USB-TTL、STM32 收发和 Python 测试链路，但不作为最终通信方案。
+### 已实现
 
-当前尚未实现：
+已完成 UART DMA + IDLE 不定长接收闭环。
 
-- DMA + IDLE 数据接收
-- Ring Buffer 数据搬运
-- 流式协议解析
-- FreeRTOS Queue 消息传递
-- Device Task 命令处理与协议响应
+- RX 使用 `HAL_UARTEx_ReceiveToIdle_DMA()`
+- DMA 使用 Normal 模式
+- DMA 接收缓冲区容量为 128 字节
+- Callback 获取有效长度并通知 CommTask
+- CommTask 使用阻塞式 TX 完成 Echo
+- Echo 完成后重新启动 RX DMA
+- Python 已验证 1、3、17、64 字节，TX == RX
+
+### 当前限制
+
+- 当前使用单接收缓冲区
+- 阻塞式发送期间 RX DMA 尚未重新启动，存在短暂接收盲区
+- IDLE 只表示串口线空闲，不等于协议帧边界
+- 尚未实现 Ring Buffer、协议解析、Queue 和 CRC16
 
 计划协议格式：
 
@@ -160,8 +171,7 @@ SOF | LEN | CMD | DATA | CRC16
 基础 UART 链路稳定后，将按以下顺序继续：
 
 ```text
-UART DMA + IDLE
-→ Ring Buffer
+Ring Buffer
 → Protocol Parser
 → FreeRTOS Queue
 → Device Task

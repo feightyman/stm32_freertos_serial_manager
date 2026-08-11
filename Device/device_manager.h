@@ -1,0 +1,4 @@
+#ifndef DEVICE_MANAGER_H
+#define DEVICE_MANAGER_H
+
+#endif /* DEVICE_MANAGER_H */

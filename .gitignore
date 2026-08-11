@@ -1,0 +1,23 @@
+# Keil MDK build outputs and per-user state
+MDK-ARM/stm32_freertos_serial_manager/
+MDK-ARM/*.lst
+MDK-ARM/*.uvguix.*
+MDK-ARM/*.uvoptx
+MDK-ARM/*.uvopt
+MDK-ARM/*.uvgui.*
+MDK-ARM/*.bak
+
+# Local editor configuration (contains machine-specific toolchain paths)
+.vscode/
+
+# Python test-tool environments and caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Operating-system metadata
+.DS_Store
+Thumbs.db
+Desktop.ini

@@ -18,6 +18,10 @@ __pycache__/
 .venv/
 venv/
 
+# Local host-side C test build artifacts
+firmware/Comm/*.exe
+firmware/Comm/*.obj
+
 # Operating-system metadata
 .DS_Store
 Thumbs.db

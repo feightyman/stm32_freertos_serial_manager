@@ -1,1 +1,62 @@
 #include "ring_buffer.h"
+#include <stdint.h>
+#include <stdbool.h>
+#define CAPACITY 256
+
+static uint8_t RingBuffer[CAPACITY];
+static volatile uint16_t head = 0U;
+static volatile uint16_t tail = 0U;
+static volatile uint16_t count = 0U;
+void RingBuffer_Init()
+{
+    for (int i = 0U ; i < CAPACITY; i++)
+    {
+        RingBuffer[i] = 0x00;
+    }
+    head = 0;
+    tail = 0;
+    count = 0;
+}
+
+bool RingBuffer_isEmpty()
+{
+    if (count == 0)
+    {
+        return true;
+    }
+    return false;
+}
+bool RingBuffer_isFull()
+{
+    if (count == CAPACITY)
+    {
+        return true;
+    }
+    return false;
+}
+
+bool RingBuffer_Writer(uint8_t data)
+{
+    if (RingBuffer_isFull())
+    {
+        return false;
+    }
+    RingBuffer[head] = data;
+    head++;
+    head == CAPACITY ? head = 0 : head;
+    count++;
+    return true;
+}
+
+bool RingBuffer_Read(uint8_t* data)
+{
+    if (RingBuffer_isEmpty())
+    {
+        return false;
+    }
+    *data = RingBuffer[tail];
+    tail++;
+    tail == CAPACITY ? tail = 0 : tail;
+    count--;
+    return true;
+}

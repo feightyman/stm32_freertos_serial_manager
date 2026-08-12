@@ -26,6 +26,7 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "usart.h"
+#include "ring_buffer.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -181,6 +182,10 @@ void StartCommTask(void *argument)
   /* USER CODE BEGIN StartCommTask */
   uint16_t echo_length;
   HAL_StatusTypeDef rx_status;
+  uint8_t Echo_Buffer[128];
+  uint8_t write_count = 0U;
+  uint8_t read_count = 0U;
+  RingBuffer_Init();
   rx_status = HAL_UARTEx_ReceiveToIdle_DMA(
     &huart1,
     uart_rx_dma_buffer,
@@ -197,16 +202,18 @@ void StartCommTask(void *argument)
     if (uart_rx_ready != 0U)
     {
       echo_length = uart_rx_length;
-      uart_rx_ready = 0U;
-      if (HAL_UART_Transmit(
-        &huart1,
-        uart_rx_dma_buffer,
-        echo_length,
-        100U
-      ) != HAL_OK)
+      for (uint8_t i = 0U; i < echo_length; i++)
       {
-        Error_Handler();
+        if (!RingBuffer_Writer(uart_rx_dma_buffer[i]))
+        {
+          break;
+        }
+        write_count++;
       }
+
+
+
+      uart_rx_ready = 0U;
       uart_rx_length = 0U;
 
       rx_status = HAL_UARTEx_ReceiveToIdle_DMA(
@@ -219,7 +226,25 @@ void StartCommTask(void *argument)
         Error_Handler();
       }
       __HAL_DMA_DISABLE_IT(huart1.hdmarx, DMA_IT_HT);
+
+      for (uint8_t i = 0U; i < write_count; i++)
+      {
+        if (!RingBuffer_Read(&Echo_Buffer[i]))
+        {
+          break;
+        }
+        read_count++;
+      }
+      if (read_count != 0)
+      {
+        if (HAL_UART_Transmit(&huart1, Echo_Buffer, read_count, 100U) != HAL_OK)
+        {
+          Error_Handler();
+        }
+      }
       comm_alive++;
+      write_count = 0U;
+      read_count = 0U;
     }
     else
     osDelay(1);

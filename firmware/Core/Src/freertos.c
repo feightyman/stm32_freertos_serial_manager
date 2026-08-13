@@ -27,6 +27,7 @@
 /* USER CODE BEGIN Includes */
 #include "usart.h"
 #include "ring_buffer.h"
+#include "protocol.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -182,10 +183,15 @@ void StartCommTask(void *argument)
   /* USER CODE BEGIN StartCommTask */
   uint16_t echo_length;
   HAL_StatusTypeDef rx_status;
+  ProtocolParser_t parser;
+  ProtocolFrame_t frame = {0};
   uint8_t Echo_Buffer[128];
   uint8_t write_count = 0U;
   uint8_t read_count = 0U;
+  uint16_t frame_count = 0U;
   RingBuffer_Init();
+  ProtocolParser_Init(&parser);
+
   rx_status = HAL_UARTEx_ReceiveToIdle_DMA(
     &huart1,
     uart_rx_dma_buffer,
@@ -211,8 +217,6 @@ void StartCommTask(void *argument)
         write_count++;
       }
 
-
-
       uart_rx_ready = 0U;
       uart_rx_length = 0U;
 
@@ -229,11 +233,14 @@ void StartCommTask(void *argument)
 
       for (uint8_t i = 0U; i < write_count; i++)
       {
-        if (!RingBuffer_Read(&Echo_Buffer[i]))
+        if (RingBuffer_Read(&Echo_Buffer[i]))
         {
-          break;
+          read_count++;
+          if (ProtocolParser_InputByte(&parser, Echo_Buffer[i], &frame))
+          {
+            frame_count++;
+          }
         }
-        read_count++;
       }
       if (read_count != 0)
       {

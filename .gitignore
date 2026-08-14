@@ -26,3 +26,6 @@ firmware/Comm/*.obj
 .DS_Store
 Thumbs.db
 Desktop.ini
+
+# Local personal notes (interview prep, daily logs) - not for sharing
+docs/

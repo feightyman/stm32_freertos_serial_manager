@@ -28,6 +28,7 @@
 #include "usart.h"
 #include "ring_buffer.h"
 #include "protocol.h"
+#include "crc16.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -53,6 +54,14 @@ volatile uint32_t comm_alive = 0;
 static uint8_t uart_rx_dma_buffer[UART_RX_DMA_BUFFER_SIZE];
 static volatile uint16_t uart_rx_length = 0U;
 static volatile uint8_t uart_rx_ready = 0U;
+volatile uint16_t ping_count = 0U;
+volatile uint16_t frame_count = 0U;
+volatile uint16_t crc_error_count = 0U;
+volatile uint16_t queue_drop_count = 0U;
+osMessageQueueId_t ProtocolQueueHandle;
+const osMessageQueueAttr_t ProtocolQueue_attributes = {
+    .name = "ProtocolQueue"
+};
 /* USER CODE END Variables */
 /* Definitions for DeviceTask */
 osThreadId_t DeviceTaskHandle;
@@ -71,7 +80,19 @@ const osThreadAttr_t CommTask_attributes = {
 
 /* Private function prototypes -----------------------------------------------*/
 /* USER CODE BEGIN FunctionPrototypes */
-
+static bool ProtocolFrame_CrcOk(const ProtocolFrame_t* frame)
+{
+  uint8_t crc_data[2U + PROTOCOL_MAX_DATA_LEN];
+  uint8_t i;
+  crc_data[0] = frame->len;
+  crc_data[1] = frame->cmd;
+  for (i = 0; i < frame->len; i++)
+  {
+    crc_data[2U + i] = frame->data[i];
+  }
+  uint16_t length = (uint16_t)(2U + frame->len);
+  return (uint16_t)(((uint16_t)frame->crc_hi << 8U) | (uint16_t)frame->crc_lo) == CRC16_CCITT_FALSE_Calc(crc_data, length);
+}
 /* USER CODE END FunctionPrototypes */
 
 void StartDeviceTask(void *argument);
@@ -132,6 +153,7 @@ void MX_FREERTOS_Init(void) {
 
   /* USER CODE BEGIN RTOS_QUEUES */
   /* add queues, ... */
+  ProtocolQueueHandle = osMessageQueueNew(8, sizeof(ProtocolFrame_t), &ProtocolQueue_attributes);
   /* USER CODE END RTOS_QUEUES */
 
   /* Create the thread(s) */
@@ -161,12 +183,35 @@ void MX_FREERTOS_Init(void) {
 void StartDeviceTask(void *argument)
 {
   /* USER CODE BEGIN StartDeviceTask */
+  ProtocolFrame_t frame = { 0 };
+  uint8_t resp[PROTOCOL_MAX_DATA_LEN];
+  const uint8_t sof = 0xAAU;
 
   /* Infinite loop */
   for(;;)
   {
-    device_alive++;
-    osDelay(1000);
+    if (osMessageQueueGet(ProtocolQueueHandle, &frame, NULL, 1000U) == osOK)
+    {
+      if (frame.cmd == CMD_PING)
+      {
+        resp[0] = sof;
+        resp[1] = 0U;
+        resp[2] = CMD_PING_RESP;
+        uint16_t crc = CRC16_CCITT_FALSE_Calc(&resp[1], 2U);
+        resp[3] = (uint8_t)(crc >> 8U);
+        resp[4] = (uint8_t)(crc & 0xFFU);
+        if (HAL_UART_Transmit(&huart1, resp, 5U, 100U) != HAL_OK)
+        {
+          Error_Handler();
+        }
+
+        ping_count++;
+      }
+    }
+    else
+    {
+      device_alive++;
+    }
   }
   /* USER CODE END StartDeviceTask */
 }
@@ -185,10 +230,11 @@ void StartCommTask(void *argument)
   HAL_StatusTypeDef rx_status;
   ProtocolParser_t parser;
   ProtocolFrame_t frame = {0};
-  uint8_t Echo_Buffer[128];
+  uint8_t byte;
   uint8_t write_count = 0U;
-  uint8_t read_count = 0U;
-  uint16_t frame_count = 0U;
+
+
+
   RingBuffer_Init();
   ProtocolParser_Init(&parser);
 
@@ -233,25 +279,30 @@ void StartCommTask(void *argument)
 
       for (uint8_t i = 0U; i < write_count; i++)
       {
-        if (RingBuffer_Read(&Echo_Buffer[i]))
+        if (RingBuffer_Read(&byte))
         {
-          read_count++;
-          if (ProtocolParser_InputByte(&parser, Echo_Buffer[i], &frame))
+          if (ProtocolParser_InputByte(&parser, byte, &frame))
           {
-            frame_count++;
+            if (ProtocolFrame_CrcOk(&frame))
+            {
+              if (osMessageQueuePut(ProtocolQueueHandle, &frame, 0U, 0U) == osOK)
+              {
+                frame_count++;
+              }
+              else
+              {
+                queue_drop_count++;
+              }
+            }
+            else
+            {
+              crc_error_count++;
+            }
           }
-        }
-      }
-      if (read_count != 0)
-      {
-        if (HAL_UART_Transmit(&huart1, Echo_Buffer, read_count, 100U) != HAL_OK)
-        {
-          Error_Handler();
         }
       }
       comm_alive++;
       write_count = 0U;
-      read_count = 0U;
     }
     else
     osDelay(1);

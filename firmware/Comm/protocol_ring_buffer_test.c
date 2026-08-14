@@ -25,7 +25,7 @@ static void TestCompleteSingleFrame(void)
         0xAAU, 0x03U, 0x10U, 0x11U
     };
     static const uint8_t batch_2[] = {
-        0x22U, 0x33U
+        0x22U, 0x33U, 0xF6, 0x9E
     };
     const size_t batch1_length = sizeof(batch_1) / sizeof(batch_1[0]);
     const size_t batch2_length = sizeof(batch_2) / sizeof(batch_2[0]);
@@ -78,6 +78,8 @@ static void TestCompleteSingleFrame(void)
     Check(frame.data[0] == 0x11U, "frame data[0] matches");
     Check(frame.data[1] == 0x22U, "frame data[1] matches");
     Check(frame.data[2] == 0x33U, "frame data[2] matches");
+    Check(frame.crc_hi == 0xF6U, "crc_hi matches");
+    Check(frame.crc_lo == 0x9EU, "crc_lo matches");
     Check(RingBuffer_isEmpty(), "ringbuffer empty");
     Check(parser.current_state == WAIT_SOF, "parser returns to WAIT_SOF");
     Check(parser.success_count == 0U, "parser data count resets");

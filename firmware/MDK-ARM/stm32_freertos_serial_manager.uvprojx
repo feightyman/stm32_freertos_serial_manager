@@ -639,6 +639,11 @@
               <FileType>5</FileType>
               <FilePath>..\Comm\ring_buffer.h</FilePath>
             </File>
+            <File>
+              <FileName>crc16.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Comm\crc16.c</FilePath>
+            </File>
           </Files>
         </Group>
         <Group>

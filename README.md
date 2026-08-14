@@ -8,41 +8,67 @@
 PC Python Test Tool
         ↓ UART
 STM32 UART → DMA + IDLE → Ring Buffer → Protocol Parser
-        → FreeRTOS Queue → Device Task → Response
+        → CRC16 校验 → FreeRTOS Queue → Device Task → Response
 ```
 
 ## 当前进度
 
-已完成 UART DMA + IDLE 不定长接收、Ring Buffer、最小 Streaming Protocol Parser 以及串口回显链路验证：
+**全链路已打通并验收**：
 
 ```text
 PC Python Test Tool
 → CH340 USB-TTL
 → STM32 USART1 RX
-→ DMA 批量接收
-→ Receive Event Callback
+→ DMA + IDLE 不定长接收
 → Ring Buffer
-→ FreeRTOS CommTask
-→ Streaming Protocol Parser
-→ Complete Frame
-→ UART Echo
+→ Streaming Protocol Parser（含 CRC 字节消费）
+→ CRC16 校验（CommTask）
+→ FreeRTOS Queue（按值传递 ProtocolFrame_t）
+→ DeviceTask（命令分发）
+→ PING Response（UART TX）
 ```
 
-已验证：
+## 协议规格
 
-- Python 可以打开串口。
-- PC 可以向 STM32 发送二进制数据。
-- DMA 可以将不定长数据搬入接收缓冲区。
-- Receive Event Callback 可以取得本批有效长度。
-- CommTask 可以将 DMA 数据写入 Ring Buffer，再读出并原样返回 PC。
-- DMA 数据复制完成后会立即重新启动接收，再执行 Echo。
-- Ring Buffer 已验证空读、正常写入/读取、写满、超容量拒绝和 head/tail 回绕。
-- Python 已验证 1、3、17、64 字节，结果均为 TX == RX。
-- 最小协议格式为 `SOF | LEN | CMD | DATA`，CRC16 暂未加入。
-- Parser 面向连续字节流，不依赖 DMA 批次或 IDLE 作为帧边界。
-- Parser 独立测试已验证完整单帧、半包、连续两帧、Garbage + 合法帧、非法 LEN 后重新同步。
-- Ring Buffer + Parser 独立集成测试已验证跨两批输入保留半包状态并提取一帧。
-- 板上已验证一帧拆成两次 DMA + IDLE 接收后，Parser 能提取 `LEN=3`、`CMD=0x10`、`DATA=0x11 0x22 0x33`。
+```text
+SOF | LEN | CMD | DATA | CRC_H | CRC_L
+```
+
+| 字段 | 说明 |
+| --- | --- |
+| SOF | 固定 `0xAA` |
+| LEN | DATA 字节数，允许 0，最大 32（不含 CMD） |
+| CMD | 命令字 |
+| DATA | 负载数据，长度由 LEN 决定 |
+| CRC_H / CRC_L | CRC16 高字节在前（先发高字节） |
+
+CRC 参数：
+
+- 算法：CRC-16/CCITT-FALSE
+- Poly `0x1021`，Init `0xFFFF`，无反射，XorOut `0x0000`
+- 标准测试向量：`"123456789"` → `0x29B1`
+- 计算范围：`LEN | CMD | DATA`（不含 SOF 和 CRC 自身）
+- 校验位置：CommTask（Parser 只负责组帧，不判断 CRC 对错）
+
+## 命令表
+
+| 命令 | 值 | 方向 | 说明 |
+| --- | --- | --- | --- |
+| CMD_PING | `0x01` | PC → MCU | 心跳探测 |
+| CMD_PING_RESP | `0x81` | MCU → PC | 响应帧（bit7 置位表示响应，`0x01 \| 0x80`） |
+
+PING 请求帧：`AA 00 01 0D 2E`，响应帧：`AA 00 81 9C A6`。
+
+## 已验证
+
+- Python 可以打开串口、发送协议帧、接收响应。
+- DMA + IDLE 不定长接收，跨 IDLE 批次保留半包状态。
+- Ring Buffer：空读、正常读写、写满拒绝、head/tail 回绕。
+- Parser：完整帧、半包、连续两帧、Garbage + 合法帧、非法 LEN 后重同步。
+- CRC16：标准向量 `0x29B1`、帧向量 `0xF69E` / `0x0D2E` 等。
+- 坏 CRC 帧：不响应、不计入正常帧数（端到端验证）。
+- PING 往返：5 次连续请求均收到 `AA 00 81 9C A6`。
+- 垃圾数据 + 合法帧：重同步后正常响应。
 
 ## 硬件与工具
 
@@ -81,7 +107,7 @@ TX 和 RX 必须交叉连接。建议使用 3.3 V TTL 电平；开发板独立�
 ├── firmware/              # STM32 固件工程
 │   ├── App/               # 应用初始化
 │   ├── BSP/               # 板级驱动接口
-│   ├── Comm/              # Ring Buffer、Protocol Parser 及独立测试
+│   ├── Comm/              # Ring Buffer、Protocol Parser、CRC16 及独立测试
 │   ├── Common/            # 公共配置与类型
 │   ├── Core/              # CubeMX 生成代码与 FreeRTOS 任务
 │   ├── Device/            # 设备管理模块骨架
@@ -90,7 +116,7 @@ TX 和 RX 必须交叉连接。建议使用 3.3 V TTL 电平；开发板独立�
 │   ├── MDK-ARM/           # Keil 工程
 │   └── stm32_freertos_serial_manager.ioc
 ├── tools/
-│   └── uart_echo_test.py  # Python 串口回显测试
+│   └── uart_ping_test.py  # Python 协议帧测试
 └── README.md
 ```
 
@@ -106,7 +132,7 @@ TX 和 RX 必须交叉连接。建议使用 3.3 V TTL 电平；开发板独立�
 3. 通过 ST-Link 将固件下载到开发板。
 4. 复位或重新上电开发板。
 
-## Python 回显测试
+## Python PING 测试
 
 安装依赖：
 
@@ -117,136 +143,106 @@ python -m pip install pyserial
 确认没有其他串口工具占用端口，然后在仓库根目录运行：
 
 ```powershell
-python tools/uart_echo_test.py COM7
+python tools/uart_ping_test.py COM7
 ```
 
-`COM7` 需要替换为实际的 CH340 串口号。测试程序在同一个串口会话中依次发送 1、3、17、64 字节，分别读取相同长度的数据并比较 TX 与 RX。
+`COM7` 需要替换为实际的 CH340 串口号。测试覆盖三组：
 
-四组测试均应输出 `PASS`：
+1. 合法 PING ×5，逐字节比对响应 `AA 00 81 9C A6`；
+2. 坏 CRC 帧 ×2，验证无响应（坏帧被丢弃）；
+3. 垃圾数据 + 合法 PING，验证错误恢复。
+
+全部通过时输出：
 
 ```text
-Length: 1  PASS
-Length: 3  PASS
-Length: 17 PASS
-Length: 64 PASS
+PING 1: PASS
+PING 2: PASS
+PING 3: PASS
+PING 4: PASS
+PING 5: PASS
+BAD CRC 1: PASS (no response)
+BAD CRC 2: PASS (no response)
+RESYNC: PASS
+ALL TESTS PASSED
 ```
 
-## Ring Buffer 独立测试
+## 独立测试（PC，无需硬件）
 
-Ring Buffer 使用固定容量的 `uint8_t` 数组，不使用 `malloc`。缓冲区满时拒绝新数据并返回失败，不覆盖已有数据。
-
-在 Visual Studio Developer PowerShell 中运行：
+在 `firmware\Comm` 目录运行：
 
 ```powershell
-cd firmware\Comm
-cl /nologo /TC /W4 ring_buffer_test.c ring_buffer.c /Fe:ring_buffer_test.exe
-.\ring_buffer_test.exe
+# CRC16 算法测试
+gcc -std=c99 -Wall -Wextra -Werror crc16_test.c crc16.c -o crc16_test.exe
+.\crc16_test.exe
+
+# Parser 测试（含 CRC 字节消费）
+gcc -std=c99 -Wall -Wextra -Werror protocol_test.c protocol.c -o protocol_test.exe
+.\protocol_test.exe
+
+# Ring Buffer + Parser 跨批次集成测试
+gcc -std=c99 -Wall -Wextra -Werror protocol_ring_buffer_test.c protocol.c ring_buffer.c -o protocol_ring_buffer_test.exe
+.\protocol_ring_buffer_test.exe
 ```
 
-独立测试覆盖空缓冲区读取、正常写入/读取、写满、超容量写入拒绝以及 head/tail 回绕。
-
-## Streaming Protocol Parser
-
-当前实现的最小协议格式：
-
-```text
-SOF | LEN | CMD | DATA
-```
-
-- `SOF` 固定为 `0xAA`。
-- `LEN` 表示 `DATA` 的字节数，不包含 `CMD`。
-- `LEN` 允许为 0，最大为 32。
-- Parser 每次接收一个字节，并在完整帧产生时返回成功。
-- Parser 状态跨函数调用、Ring Buffer 读空和 DMA + IDLE 接收批次保留。
-- CRC16 暂未实现。
-
-在 `firmware\Comm` 目录运行 Parser 独立测试：
-
-```powershell
-gcc -std=c99 -Wall -Wextra -Werror `
-    protocol_test.c protocol.c `
-    -o protocol_test.exe
-\.\protocol_test.exe
-```
-
-测试覆盖：
-
-- 完整单帧
-- 半包
-- 连续两帧
-- Garbage + 合法帧
-- 非法 LEN 后重新同步
-
-运行 Ring Buffer + Parser 独立集成测试：
-
-```powershell
-gcc -std=c99 -Wall -Wextra -Werror `
-    protocol_ring_buffer_test.c protocol.c ring_buffer.c `
-    -o protocol_ring_buffer_test.exe
-\.\protocol_ring_buffer_test.exe
-```
-
-该测试将一帧拆成两批写入 Ring Buffer，验证第一批读空后 Parser 保留半包状态，第二批到达后恰好提取一个完整 Frame。
+均输出 `ALL TESTS PASSED`。
 
 ## 当前实现说明
 
-### 已实现
+### 接收路径（CommTask）
 
-已完成 UART DMA + IDLE → Ring Buffer → CommTask → Streaming Protocol Parser → Complete Frame 闭环，同时保留 Echo 便于链路调试。
+- RX 使用 `HAL_UARTEx_ReceiveToIdle_DMA()`，Normal 模式，缓冲区 128 字节。
+- Callback 获取有效长度并通知 CommTask。
+- CommTask 将 DMA 数据写入 Ring Buffer（256 字节，满则拒绝），再逐字节读出送入 Parser。
+- Parser 输出完整帧（含 CRC 两个字节）后，CommTask 计算 `LEN|CMD|DATA` 的 CRC 并与帧内 CRC 比对：通过则按值入队，失败则丢帧并计数。
+- 队列满时非阻塞丢弃并计数，不阻塞接收路径。
 
-- RX 使用 `HAL_UARTEx_ReceiveToIdle_DMA()`
-- DMA 使用 Normal 模式
-- DMA 接收缓冲区容量为 128 字节
-- Callback 获取有效长度并通知 CommTask
-- Ring Buffer 容量为 256 字节，满时拒绝新数据
-- CommTask 将 DMA 有效数据写入 Ring Buffer，再逐字节读出并送入 Parser
-- Parser 在 CommTask 启动时初始化一次，不随 DMA/IDLE 批次重新初始化
-- 提取完整帧后通过 `frame_count` 进行板上调试验证
-- DMA 在数据复制完成后立即重新启动
-- CommTask 使用阻塞式 TX 完成 Echo
-- Python 已验证 1、3、17、64 字节，TX == RX
+### 发送路径（DeviceTask）
 
-### 当前限制
+- `osMessageQueueGet` 等待命令帧（1000 ms 超时，超时则维持心跳计数）。
+- 收到 `CMD_PING` 构建响应帧 `SOF|LEN|CMD|CRC_H|CRC_L`，阻塞式 `HAL_UART_Transmit` 发送。
+- 全系统只有一个写者（DeviceTask）写 USART1，因此无需 Mutex 也不会互相打断。
 
-- 当前使用单接收缓冲区
-- RX 使用 Normal DMA，每次 IDLE 或接收满后需要由 CommTask 重新启动
-- Ring Buffer 满时本批剩余数据会被拒绝，当前仅通过返回值体现
-- IDLE 只表示串口线空闲，不等于协议帧边界
-- 当前只提取完整 Frame，尚未接入 FreeRTOS Queue 和 Device Task
-- 尚未实现 CRC16
+### 关键设计决策
 
-当前最小协议格式与后续目标：
+- **Queue 按值传递**：`ProtocolFrame_t` 为 36 字节定长结构（全 `uint8_t` 无 padding），入队即拷贝，无指针生命周期问题。
+- **Parser 与 CRC 分离**：Parser 只负责组帧与重同步，CRC 校验在 CommTask —— 坏帧不会进入队列，职责单一、易调试。
+- **任务上下文使用普通队列 API**：Parser 在 CommTask 内运行，入队用 `osMessageQueuePut`（非 FromISR 版），语义正确。
+- **CRC_H 在前**：发送与接收同一字节序约定，`ProtocolFrame_CrcOk` 与响应构建共用同一计算范围规则（跳过 SOF、不含 CRC 自身）。
 
-```text
-当前：SOF | LEN | CMD | DATA
-目标：SOF | LEN | CMD | DATA | CRC16
-```
+## 当前限制（技术债）
+
+- Normal DMA blind window：IDLE 事件到 CommTask 重新启动 DMA 之间到达的字节会丢失（HAL 在 IDLE 时停止 DMA）。当前测试节奏下未触发，后续如需消除需改 DMA 架构。
+- 无 TX DMA，响应使用阻塞发送（任务上下文可接受）。
+- Ring Buffer 满时本批剩余数据被拒绝（仅计数）。
+- 队列满时丢帧（仅计数），无重传机制。
 
 ## 常见问题
 
-### 串口可以打开，但没有收到回显
+### 串口可以打开，但 PING 无响应
 
 依次检查：
 
-1. USB-TTL TX 是否连接 PA10。
-2. USB-TTL RX 是否连接 PA9。
-3. USB-TTL 与 STM32 是否共地。
-4. 串口参数是否为 115200、8N1、无流控。
-5. COM 口是否被其他程序占用。
+1. USB-TTL TX 是否连接 PA10，RX 是否连接 PA9，是否共地。
+2. 串口参数是否为 115200、8N1、无流控。
+3. COM 口是否被其他程序占用。
+4. 发送的帧是否带正确 CRC（可用 `tools/uart_ping_test.py` 自动构造）。
+5. Keil 调试会话是否处于暂停状态（暂停时 DMA 照收但任务不处理，恢复后可能补处理积压数据）。
 
-### Python 只收到部分数据
+### PING 偶发失败
 
-`serial.read(size)` 在超时后可能返回少于 `size` 的数据。测试时应检查实际接收长度，并重复执行和断电重启测试，确认链路稳定。
+- 检查是否发送过快：帧之间留出响应时间（115200 下响应约 0.5 ms，1 s 超时足够）。
+- 若怀疑 DMA blind window 丢字节，降低发送频率或改为整帧单次发送后等待响应。
 
 ## 下一阶段
 
-当前阶段已经完成最小 Streaming Parser 与 Ring Buffer 集成验证。后续按计划继续：
+当前链路已全部打通并验收：
 
 ```text
-CRC16
-→ FreeRTOS Queue
-→ Device Task
-→ Response
+UART DMA + IDLE → Ring Buffer → Parser → CRC16 → Queue → Device Task → Response
 ```
 
-本阶段不继续扩展 Queue 或 Device Task；每个后续模块仍需先独立测试，再接入现有链路。
+**停止新增大型功能，进入测试和面试阶段**：
+
+- 稳定性测试：长时间连续 PING、异常输入注入、断电重启回归。
+- 面试讲稿：能解释每个模块的设计决策与 trade-off（见"关键设计决策"）。
+- Debug 故事：sizeof 长度 Bug、CRC 字节序窄化、调试器暂停假失败。

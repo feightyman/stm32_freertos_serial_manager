@@ -45,17 +45,9 @@ bool ProtocolParser_InputByte(ProtocolParser_t* parser, uint8_t byte, ProtocolFr
     case READ_CMD:
     {
         parser->current_frame.cmd = byte;
-        if (parser->current_frame.len == 0U)
-        {
-            *frame = parser->current_frame;
-            parser->success_count = 0U;
-            parser->current_state = WAIT_SOF;
-            return true;
-        }
-        else
-        {
-            parser->current_state++;
-        }
+        parser->success_count = 0U;
+        
+        parser->current_state = (parser->current_frame.len == 0U) ? READ_CRC_H : READ_DATA;
     }
         break;
     case READ_DATA:
@@ -64,13 +56,24 @@ bool ProtocolParser_InputByte(ProtocolParser_t* parser, uint8_t byte, ProtocolFr
         parser->success_count++;
         if (parser->success_count == parser->current_frame.len)
         {
-            *frame = parser->current_frame;
-            parser->success_count = 0U;
-            parser->current_state = WAIT_SOF;
-            return true;
+            parser->current_state++;
         }
     }
-        break;
+    break;
+    case READ_CRC_H:
+    {
+        parser->current_frame.crc_hi = byte;
+        parser->current_state++;
+    }
+    break;
+    case READ_CRC_L:
+    {
+        parser->current_frame.crc_lo = byte;
+        *frame = parser->current_frame;
+        parser->success_count = 0U;
+        parser->current_state = WAIT_SOF;
+        return true;
+    }
     default:
         return false;
     }

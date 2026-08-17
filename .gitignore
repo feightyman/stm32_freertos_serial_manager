@@ -29,3 +29,6 @@ Desktop.ini
 
 # Local personal notes (interview prep, daily logs) - not for sharing
 docs/
+
+# AGENTS.md is a local workspace instruction file, not part of the project history
+/AGENTS.md

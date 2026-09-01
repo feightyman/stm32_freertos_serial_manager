@@ -1,75 +1,529 @@
 import sys
-import serial
 import time
+from dataclasses import dataclass
+from typing import Callable
+
+import serial
+
+
+SOF = 0xAA
+PROTOCOL_MAX_DATA_LEN = 32
+
+CMD_PING = 0x01
+CMD_PING_RESP = 0x81
+CMD_SET_MODE = 0x02
+RESP_SET_MODE = 0x82
+CMD_GET_STATUS = 0x03
+RESP_GET_STATUS = 0x83
+RESP_ERROR = 0xFF
+
+ERR_INVALID_LENGTH = 0x01
+ERR_INVALID_PARAM = 0x02
+ERR_UNKNOWN_CMD = 0x03
+
+MODE_IDLE = 0x00
+MODE_ACTIVE = 0x01
+INVALID_MODE = 0xFF
+UNKNOWN_CMD = 0x7E
+
+BAUD_RATE = 115200
+RESPONSE_TIMEOUT_S = 1.0
+NO_RESPONSE_TIMEOUT_S = 1.0
+READ_POLL_SLICE_S = 0.05
+STARTUP_SETTLE_S = 0.10
+HALF_PACKET_GAP_S = 0.05
+PING_REPETITIONS = 5
+BAD_CRC_REPETITIONS = 2
+GARBAGE_PREFIX = bytes([0x00, 0x55, 0xFF, 0x7E])
+
+
+class FrameReadError(RuntimeError):
+    """Base class for receive-side protocol failures."""
+
+
+class NoResponseTimeout(FrameReadError):
+    """No SOF was received before the overall deadline."""
+
+
+class IncompleteFrame(FrameReadError):
+    """A frame started but was not completed before the overall deadline."""
+
+
+class InvalidFrameLength(FrameReadError):
+    """Only malformed frame candidates with invalid LEN were received."""
+
+
+class FrameCrcError(FrameReadError):
+    """A complete frame was received with a mismatching CRC."""
+
+
+@dataclass(frozen=True)
+class ReceivedFrame:
+    raw: bytes
+    length: int
+    cmd: int
+    data: bytes
+    crc: int
+    discarded_prefix: bytes = b""
 
 
 def crc16_ccitt_false(data: bytes) -> int:
     crc = 0xFFFF
-    for b in data:
-        crc ^= b << 8
+    for byte in data:
+        crc ^= byte << 8
         for _ in range(8):
-            crc = ((crc << 1) ^ 0x1021) & 0xFFFF if crc & 0x8000 else (crc << 1) & 0xFFFF
+            if crc & 0x8000:
+                crc = ((crc << 1) ^ 0x1021) & 0xFFFF
+            else:
+                crc = (crc << 1) & 0xFFFF
     return crc
 
 
 def build_frame(cmd: int, data: bytes = b"") -> bytes:
+    if not 0 <= cmd <= 0xFF:
+        raise ValueError(f"CMD out of range: {cmd}")
+    if len(data) > PROTOCOL_MAX_DATA_LEN:
+        raise ValueError(
+            f"DATA too long: {len(data)} > {PROTOCOL_MAX_DATA_LEN}"
+        )
+
     payload = bytes([len(data), cmd]) + data
     crc = crc16_ccitt_false(payload)
-    return bytes([0xAA, len(data), cmd]) + data + bytes([(crc >> 8) & 0xFF, crc & 0xFF])
+    return bytes([SOF]) + payload + crc.to_bytes(2, "big")
 
 
-PING = build_frame(0x01)                        # AA 00 01 0D 2E
-PING_RESP = bytes([0xAA, 0x00, 0x81, 0x9C, 0xA6])
-BAD_CRC = bytes([0xAA, 0x00, 0x01, 0x0D, 0x2F])  # 故意错 CRC
-GARBAGE = bytes([0x00, 0x55, 0xFF, 0x7E])
+def read_exact(ser: serial.Serial, size: int, deadline: float, stage: str) -> bytes:
+    received = bytearray()
+
+    while len(received) < size:
+        remaining_time = deadline - time.monotonic()
+        if remaining_time <= 0:
+            raise IncompleteFrame(
+                f"timeout while reading {stage}: "
+                f"received {len(received)}/{size} byte(s), partial={received.hex(' ')}"
+            )
+
+        previous_timeout = ser.timeout
+        try:
+            ser.timeout = min(READ_POLL_SLICE_S, remaining_time)
+            chunk = ser.read(size - len(received))
+        finally:
+            ser.timeout = previous_timeout
+
+        if chunk:
+            received.extend(chunk)
+
+    return bytes(received)
 
 
-def main():
-    if len(sys.argv) != 2:
-        print("Usage: %s <port>" % sys.argv[0])
-        return
-    ser = serial.Serial(sys.argv[1], 115200, timeout=1)
-    failures = 0
+def read_frame(ser: serial.Serial, timeout_s: float = RESPONSE_TIMEOUT_S) -> ReceivedFrame:
+    deadline = time.monotonic() + timeout_s
+    discarded = bytearray()
+    saw_any_byte = False
+    saw_sof = False
+    last_invalid_length = None
+    pending_sof = False
 
-    # 1. 合法 PING x5
-    for i in range(1, 6):
-        ser.reset_input_buffer()
-        ser.write(PING)
-        ser.flush()
-        rx = ser.read(5)
-        if rx == PING_RESP:
-            print("PING %d: PASS" % i)
+    while True:
+        if pending_sof:
+            marker = bytes([SOF])
+            pending_sof = False
         else:
-            print("PING %d: FAIL RX=%s" % (i, rx.hex(" ")))
-            failures += 1
+            remaining_time = deadline - time.monotonic()
+            if remaining_time <= 0:
+                if last_invalid_length is not None:
+                    raise InvalidFrameLength(
+                        f"no valid frame followed invalid LEN={last_invalid_length}; "
+                        f"discarded={discarded.hex(' ')}"
+                    )
+                if saw_sof:
+                    raise IncompleteFrame(
+                        "timeout after SOF while waiting for LEN"
+                    )
+                if saw_any_byte:
+                    raise NoResponseTimeout(
+                        f"only non-SOF bytes received: {discarded.hex(' ')}"
+                    )
+                raise NoResponseTimeout("no response before overall deadline")
 
-    # 2. 坏 CRC x2 -> 不应有响应
-    for i in range(1, 3):
-        ser.reset_input_buffer()
-        ser.write(BAD_CRC)
-        ser.flush()
-        time.sleep(0.2)
-        rx = ser.read(1)
-        if rx == b"":
-            print("BAD CRC %d: PASS (no response)" % i)
-        else:
-            print("BAD CRC %d: FAIL RX=%s" % (i, rx.hex(" ")))
-            failures += 1
+            previous_timeout = ser.timeout
+            try:
+                ser.timeout = min(READ_POLL_SLICE_S, remaining_time)
+                marker = ser.read(1)
+            finally:
+                ser.timeout = previous_timeout
 
-    # 3. 垃圾数据 + 合法 PING -> 重同步并响应
-    ser.reset_input_buffer()
-    ser.write(GARBAGE + PING)
+            if not marker:
+                continue
+            saw_any_byte = True
+
+        if marker[0] != SOF:
+            discarded.extend(marker)
+            continue
+
+        saw_sof = True
+        try:
+            length_bytes = read_exact(ser, 1, deadline, "LEN")
+        except IncompleteFrame as exc:
+            raise IncompleteFrame(
+                f"timeout after SOF while reading LEN; discarded={discarded.hex(' ')}"
+            ) from exc
+
+        length = length_bytes[0]
+        if length > PROTOCOL_MAX_DATA_LEN:
+            discarded.extend((SOF, length))
+            last_invalid_length = length
+            if length == SOF:
+                pending_sof = True
+            continue
+
+        tail = read_exact(
+            ser,
+            length + 3,
+            deadline,
+            f"CMD + DATA({length}) + CRC16",
+        )
+        cmd = tail[0]
+        data = tail[1 : 1 + length]
+        received_crc = int.from_bytes(tail[-2:], "big")
+        crc_input = length_bytes + tail[:-2]
+        expected_crc = crc16_ccitt_false(crc_input)
+        raw = bytes([SOF]) + length_bytes + tail
+
+        if received_crc != expected_crc:
+            raise FrameCrcError(
+                f"CRC mismatch: received=0x{received_crc:04X}, "
+                f"expected=0x{expected_crc:04X}, frame={raw.hex(' ')}"
+            )
+
+        return ReceivedFrame(
+            raw=raw,
+            length=length,
+            cmd=cmd,
+            data=data,
+            crc=received_crc,
+            discarded_prefix=bytes(discarded),
+        )
+
+
+def read_buffered_input(ser: serial.Serial) -> bytes:
+    waiting = ser.in_waiting
+    return ser.read(waiting) if waiting else b""
+
+
+def require_clean_input(ser: serial.Serial, context: str) -> None:
+    pending = read_buffered_input(ser)
+    if pending:
+        raise AssertionError(
+            f"unexpected buffered input before {context}: {pending.hex(' ')}"
+        )
+
+
+def write_all(ser: serial.Serial, data: bytes) -> None:
+    written = ser.write(data)
     ser.flush()
-    rx = ser.read(5)
-    if rx == PING_RESP:
-        print("RESYNC: PASS")
-    else:
-        print("RESYNC: FAIL RX=%s" % rx.hex(" "))
-        failures += 1
+    if written != len(data):
+        raise IOError(f"short serial write: wrote {written}/{len(data)} byte(s)")
 
-    ser.close()
-    print("ALL TESTS PASSED" if failures == 0 else "TESTS FAILED: %d" % failures)
+
+def assert_frame(
+    frame: ReceivedFrame,
+    expected_cmd: int,
+    expected_data: bytes,
+    context: str,
+) -> None:
+    if frame.discarded_prefix:
+        raise AssertionError(
+            f"{context}: discarded unexpected response prefix "
+            f"{frame.discarded_prefix.hex(' ')}"
+        )
+    if frame.cmd != expected_cmd:
+        raise AssertionError(
+            f"{context}: CMD=0x{frame.cmd:02X}, expected=0x{expected_cmd:02X}"
+        )
+    if frame.length != len(expected_data):
+        raise AssertionError(
+            f"{context}: LEN={frame.length}, expected={len(expected_data)}"
+        )
+    if frame.data != expected_data:
+        raise AssertionError(
+            f"{context}: DATA={frame.data.hex(' ')}, "
+            f"expected={expected_data.hex(' ')}"
+        )
+
+    expected_raw = build_frame(expected_cmd, expected_data)
+    if frame.raw != expected_raw:
+        raise AssertionError(
+            f"{context}: frame={frame.raw.hex(' ')}, "
+            f"expected={expected_raw.hex(' ')}"
+        )
+
+
+def send_and_expect(
+    ser: serial.Serial,
+    request: bytes,
+    expected_cmd: int,
+    expected_data: bytes,
+    context: str,
+) -> ReceivedFrame:
+    require_clean_input(ser, context)
+    write_all(ser, request)
+    response = read_frame(ser)
+    assert_frame(response, expected_cmd, expected_data, context)
+    return response
+
+
+def assert_no_response(
+    ser: serial.Serial,
+    timeout_s: float,
+    context: str,
+) -> None:
+    deadline = time.monotonic() + timeout_s
+    received = bytearray()
+
+    while time.monotonic() < deadline:
+        buffered = read_buffered_input(ser)
+        if buffered:
+            received.extend(buffered)
+            break
+
+        remaining_time = deadline - time.monotonic()
+        if remaining_time <= 0:
+            break
+
+        previous_timeout = ser.timeout
+        try:
+            ser.timeout = min(READ_POLL_SLICE_S, remaining_time)
+            chunk = ser.read(1)
+        finally:
+            ser.timeout = previous_timeout
+
+        if chunk:
+            received.extend(chunk)
+            received.extend(read_buffered_input(ser))
+            break
+
+    if received:
+        raise AssertionError(
+            f"{context}: expected silence, received {received.hex(' ')}"
+        )
+
+
+def run_case(
+    name: str,
+    action: Callable[[], None],
+    failures: list[str],
+) -> None:
+    try:
+        action()
+    except Exception as exc:
+        failures.append(f"{name}: {exc}")
+        print(f"[FAIL] {name}: {exc}")
+    else:
+        print(f"[PASS] {name}")
+
+
+def main() -> int:
+    if len(sys.argv) != 2:
+        print(f"Usage: {sys.argv[0]} COMx")
+        return 2
+
+    port = sys.argv[1]
+    failures: list[str] = []
+
+    try:
+        ser = serial.Serial(
+            port=port,
+            baudrate=BAUD_RATE,
+            timeout=READ_POLL_SLICE_S,
+        )
+    except serial.SerialException as exc:
+        print(f"Cannot open {port}: {exc}")
+        return 2
+
+    def test_ping() -> None:
+        for index in range(PING_REPETITIONS):
+            send_and_expect(
+                ser,
+                build_frame(CMD_PING),
+                CMD_PING_RESP,
+                b"",
+                f"PING repetition {index + 1}",
+            )
+
+    def test_initial_status() -> None:
+        send_and_expect(
+            ser,
+            build_frame(CMD_GET_STATUS),
+            RESP_GET_STATUS,
+            bytes([MODE_IDLE]),
+            "initial GET_STATUS",
+        )
+
+    def test_set_active_and_get() -> None:
+        send_and_expect(
+            ser,
+            build_frame(CMD_SET_MODE, bytes([MODE_ACTIVE])),
+            RESP_SET_MODE,
+            bytes([MODE_ACTIVE]),
+            "SET_MODE(ACTIVE)",
+        )
+        send_and_expect(
+            ser,
+            build_frame(CMD_GET_STATUS),
+            RESP_GET_STATUS,
+            bytes([MODE_ACTIVE]),
+            "GET_STATUS after SET_MODE(ACTIVE)",
+        )
+
+    def test_invalid_mode_preserves_state() -> None:
+        send_and_expect(
+            ser,
+            build_frame(CMD_SET_MODE, bytes([INVALID_MODE])),
+            RESP_ERROR,
+            bytes([CMD_SET_MODE, ERR_INVALID_PARAM]),
+            "SET_MODE(invalid)",
+        )
+        send_and_expect(
+            ser,
+            build_frame(CMD_GET_STATUS),
+            RESP_GET_STATUS,
+            bytes([MODE_ACTIVE]),
+            "GET_STATUS after invalid mode",
+        )
+
+    def test_invalid_length() -> None:
+        send_and_expect(
+            ser,
+            build_frame(CMD_SET_MODE),
+            RESP_ERROR,
+            bytes([CMD_SET_MODE, ERR_INVALID_LENGTH]),
+            "SET_MODE with invalid LEN",
+        )
+
+    def test_unknown_command() -> None:
+        send_and_expect(
+            ser,
+            build_frame(UNKNOWN_CMD),
+            RESP_ERROR,
+            bytes([UNKNOWN_CMD, ERR_UNKNOWN_CMD]),
+            "unknown CMD",
+        )
+
+    def test_bad_crc_is_silent() -> None:
+        require_clean_input(ser, "Bad CRC")
+        bad_crc_frame = bytearray(build_frame(CMD_PING))
+        bad_crc_frame[-1] ^= 0x01
+
+        for index in range(BAD_CRC_REPETITIONS):
+            write_all(ser, bytes(bad_crc_frame))
+            assert_no_response(
+                ser,
+                NO_RESPONSE_TIMEOUT_S,
+                f"Bad CRC repetition {index + 1}",
+            )
+
+    def test_half_packet() -> None:
+        require_clean_input(ser, "Half Packet")
+        request = build_frame(CMD_PING)
+        split_at = 2
+        write_all(ser, request[:split_at])
+        time.sleep(HALF_PACKET_GAP_S)
+        require_clean_input(ser, "second half of Half Packet")
+        write_all(ser, request[split_at:])
+        response = read_frame(ser)
+        assert_frame(response, CMD_PING_RESP, b"", "Half Packet")
+
+    def test_continuous_frames() -> None:
+        require_clean_input(ser, "Continuous Frames")
+        request = build_frame(CMD_PING)
+        write_all(ser, request + request)
+
+        first = read_frame(ser)
+        assert_frame(first, CMD_PING_RESP, b"", "Continuous Frames #1")
+        second = read_frame(ser)
+        assert_frame(second, CMD_PING_RESP, b"", "Continuous Frames #2")
+
+    def test_garbage_prefix() -> None:
+        require_clean_input(ser, "Garbage")
+        write_all(ser, GARBAGE_PREFIX + build_frame(CMD_PING))
+        response = read_frame(ser)
+        assert_frame(response, CMD_PING_RESP, b"", "Garbage")
+
+    def test_invalid_length_resynchronization() -> None:
+        require_clean_input(ser, "Resynchronization")
+        malformed_prefix = bytes([SOF, PROTOCOL_MAX_DATA_LEN + 1])
+        write_all(ser, malformed_prefix + build_frame(CMD_PING))
+        response = read_frame(ser)
+        assert_frame(response, CMD_PING_RESP, b"", "Resynchronization")
+
+    def cleanup_idle() -> None:
+        cleanup_issues = []
+        pending = read_buffered_input(ser)
+        if pending:
+            cleanup_issues.append(
+                f"discarded pending input before cleanup: {pending.hex(' ')}"
+            )
+
+        try:
+            send_and_expect(
+                ser,
+                build_frame(CMD_SET_MODE, bytes([MODE_IDLE])),
+                RESP_SET_MODE,
+                bytes([MODE_IDLE]),
+                "final SET_MODE(IDLE)",
+            )
+            send_and_expect(
+                ser,
+                build_frame(CMD_GET_STATUS),
+                RESP_GET_STATUS,
+                bytes([MODE_IDLE]),
+                "final GET_STATUS",
+            )
+        except Exception as exc:
+            cleanup_issues.append(str(exc))
+
+        if cleanup_issues:
+            raise AssertionError("; ".join(cleanup_issues))
+
+    try:
+        time.sleep(STARTUP_SETTLE_S)
+        startup_bytes = read_buffered_input(ser)
+        if startup_bytes:
+            print(f"[INFO] discarded startup input: {startup_bytes.hex(' ')}")
+
+        run_case("1. PING", test_ping, failures)
+        run_case("2. Initial GET_STATUS is IDLE", test_initial_status, failures)
+        run_case("3. SET_MODE(ACTIVE) then GET_STATUS", test_set_active_and_get, failures)
+        run_case(
+            "4. Invalid mode is rejected and state remains ACTIVE",
+            test_invalid_mode_preserves_state,
+            failures,
+        )
+        run_case("5. Invalid LEN", test_invalid_length, failures)
+        run_case("6. Unknown CMD", test_unknown_command, failures)
+        run_case("7. Bad CRC is silent", test_bad_crc_is_silent, failures)
+        run_case("R1. Half Packet", test_half_packet, failures)
+        run_case("R2. Continuous Frames", test_continuous_frames, failures)
+        run_case("R3. Garbage before frame", test_garbage_prefix, failures)
+        run_case(
+            "R4. Invalid LEN resynchronization",
+            test_invalid_length_resynchronization,
+            failures,
+        )
+    finally:
+        run_case("8. Restore IDLE", cleanup_idle, failures)
+        ser.close()
+
+    if failures:
+        print(f"\n{len(failures)} test(s) failed:")
+        for failure in failures:
+            print(f"  - {failure}")
+        return 1
+
+    print("\nALL TESTS PASSED")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

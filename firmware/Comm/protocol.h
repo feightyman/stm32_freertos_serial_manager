@@ -4,7 +4,17 @@
 #include "stdbool.h"
 #define PROTOCOL_MAX_DATA_LEN 32U
 #define CMD_PING 0x01U
-#define CMD_PING_RESP 0x81U   /* 响应约定：bit7 置位（0x01 | 0x80）*/
+#define CMD_GET_STATUS 0x03U
+#define RESP_GET_STATUS 0x83U
+#define CMD_PING_RESP 0x81U
+#define CMD_SET_MODE 0x02U
+#define RESP_SET_MODE 0x82U
+
+#define RESP_ERROR 0xFFU
+#define ERR_INVALID_LENGTH 0x01U
+#define ERR_INVALID_PARAM 0x02U
+#define ERR_UNKNOWN_CMD 0x03U
+
 typedef enum
 {
     WAIT_SOF = 0,

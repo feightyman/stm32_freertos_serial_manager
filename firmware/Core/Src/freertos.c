@@ -29,6 +29,7 @@
 #include "ring_buffer.h"
 #include "protocol.h"
 #include "crc16.h"
+#include "device_manager.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -92,6 +93,24 @@ static bool ProtocolFrame_CrcOk(const ProtocolFrame_t* frame)
   }
   uint16_t length = (uint16_t)(2U + frame->len);
   return (uint16_t)(((uint16_t)frame->crc_hi << 8U) | (uint16_t)frame->crc_lo) == CRC16_CCITT_FALSE_Calc(crc_data, length);
+}
+
+static void DeviceTask_SendErrorResponse(uint8_t failed_cmd,uint8_t error_code)
+{
+  uint8_t resp[PROTOCOL_MAX_DATA_LEN];
+  const uint8_t sof = 0xAAU;
+  resp[0] = sof;
+  resp[1] = 2U;
+  resp[2] = RESP_ERROR;
+  resp[3] = failed_cmd;
+  resp[4] = error_code;
+  uint16_t crc = CRC16_CCITT_FALSE_Calc(&resp[1], 4U);
+  resp[5] = (uint8_t)(crc >> 8U);
+  resp[6] = (uint8_t)(crc & 0xFFU);
+  if (HAL_UART_Transmit(&huart1, resp, 7U, 100U) != HAL_OK)
+  {
+    Error_Handler();
+  }
 }
 /* USER CODE END FunctionPrototypes */
 
@@ -186,13 +205,17 @@ void StartDeviceTask(void *argument)
   ProtocolFrame_t frame = { 0 };
   uint8_t resp[PROTOCOL_MAX_DATA_LEN];
   const uint8_t sof = 0xAAU;
+  DeviceManager_Init();
+  DeviceState_t current_state;
 
   /* Infinite loop */
   for(;;)
   {
     if (osMessageQueueGet(ProtocolQueueHandle, &frame, NULL, 1000U) == osOK)
     {
-      if (frame.cmd == CMD_PING)
+      switch (frame.cmd)
+      {
+      case CMD_PING:
       {
         resp[0] = sof;
         resp[1] = 0U;
@@ -206,6 +229,59 @@ void StartDeviceTask(void *argument)
         }
 
         ping_count++;
+      }
+      break;
+      case CMD_GET_STATUS:
+      {
+        if (frame.len != 0U)
+        {
+          DeviceTask_SendErrorResponse(CMD_GET_STATUS, ERR_INVALID_LENGTH);
+          break;
+        }
+        resp[0] = sof;
+        resp[1] = 1U;
+        resp[2] = RESP_GET_STATUS;
+        current_state = DeviceManager_GetState();
+        resp[3] = current_state.mode;
+        uint16_t crc = CRC16_CCITT_FALSE_Calc(&resp[1], 3U);
+        resp[4] = (uint8_t)(crc >> 8U);
+        resp[5] = (uint8_t)(crc & 0xFFU);
+        if (HAL_UART_Transmit(&huart1, resp, 6U, 100U) != HAL_OK)
+        {
+          Error_Handler();
+        }
+      }
+      break;
+      case CMD_SET_MODE:
+      {
+        if (frame.len != 1U)
+        {
+          DeviceTask_SendErrorResponse(CMD_SET_MODE, ERR_INVALID_LENGTH);
+          break;
+        }
+        if (DeviceManager_SetMode(frame.data[0]))
+        {
+          resp[0] = sof;
+          resp[1] = 1U;
+          resp[2] = RESP_SET_MODE;
+          resp[3] = frame.data[0];
+          uint16_t crc = CRC16_CCITT_FALSE_Calc(&resp[1], 3U);
+          resp[4] = (uint8_t)(crc >> 8U);
+          resp[5] = (uint8_t)(crc & 0xFFU);
+          if (HAL_UART_Transmit(&huart1, resp, 6U, 100U) != HAL_OK)
+          {
+            Error_Handler();
+          }
+        }
+        else
+        {
+          DeviceTask_SendErrorResponse(CMD_SET_MODE, ERR_INVALID_PARAM);
+        }
+      }
+      break;
+      default:
+        DeviceTask_SendErrorResponse(frame.cmd, ERR_UNKNOWN_CMD);
+        break;
       }
     }
     else

@@ -1,3 +1,4 @@
+/* PC 侧 CRC 单元测试：覆盖标准向量、协议向量以及空输入边界。 */
 #include "crc16.h"
 #include "stdbool.h"
 #include "stdio.h"
@@ -27,6 +28,7 @@ static void StdCheck(void)
 
 static void UserCheck(void)
 {
+    /* 输入按协议 CRC 范围组织为 [LEN, CMD, DATA...]，不包含 SOF。 */
     uint8_t input[] = {
         0x03U, 0x10U, 0x11U, 0x22U, 0x33U
     };
@@ -37,6 +39,7 @@ static void UserCheck(void)
 
 static void PingCheck(void)
 {
+    /* PING 无 DATA，因此 CRC 输入只有 LEN=0 和 CMD=0x01。 */
     uint8_t input[] = {
         0x00U, 0x01U
     };
@@ -48,6 +51,7 @@ static void PingCheck(void)
 static void EmptyCheck(void)
 {
 
+    /* length=0 时实现不得访问 data，允许使用 NULL 验证初始值。 */
     uint16_t crc = CRC16_CCITT_FALSE_Calc(NULL, 0U);
     Check(crc == 0xFFFF, "EMPTY CHECK");
 }

@@ -1,3 +1,7 @@
+/*
+ * PC 侧流式 Parser 单元测试。
+ * Parser 只判断帧边界并保存 CRC 字节，CRC 正确性由固件上层另行校验。
+ */
 #include "protocol.h"
 
 #include <stdbool.h>
@@ -67,6 +71,7 @@ static void TestCompleteSingleFrame(void)
 
 static void TestPartialFrame(void)
 {
+    /* 在 DATA 中间暂停输入，验证 Parser 状态能够跨调用批次保留。 */
     static const uint8_t input[] = {
     0xAAU, 0x03U, 0x10U, 0x11U, 0x22U, 0x33U,
     0xF6U, 0x9EU
@@ -222,6 +227,7 @@ static void TestGarbageBeforeValidFrame(void)
 
 static void TestInvalidLengthRecovery(void)
 {
+    /* 0x21 超过最大 DATA 长度 32，随后紧接的合法帧应仍可被识别。 */
     static const uint8_t input[] = {
         0xAAU, 0x21U,
         0xAAU, 0x02U, 0x40U, 0x11U, 0x22U,
@@ -304,6 +310,7 @@ static void TestLenZeroFrameWithCRC(void)
 
 static void TestCRCParsedButNotValidated(void)
 {
+    /* 故意使用错误 CRC_L，确认 Parser 完成组帧但不越权执行 CRC 判定。 */
     static const uint8_t input[] = { 0xAA, 0x00, 0x01, 0x0D, 0x2F };
     const size_t input_length = sizeof(input) / sizeof(input[0]);
     ProtocolParser_t parser;

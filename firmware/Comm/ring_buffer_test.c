@@ -1,3 +1,4 @@
+/* PC 侧 Ring Buffer 单元测试：验证容量边界、FIFO 顺序以及索引回绕。 */
 #include "ring_buffer.h"
 
 #include <stdbool.h>
@@ -94,6 +95,7 @@ static void TestWrapAround(void)
 
     RingBuffer_Init();
 
+    /* 先写 200、读 150，再写 150，强制 head 跨过物理数组末尾。 */
     for (index = 0U; index < 200U; index++)
     {
         if (!RingBuffer_Writer((uint8_t)index))

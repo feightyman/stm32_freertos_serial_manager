@@ -1,5 +1,6 @@
 #include "protocol.h"
 
+/* 本模块只负责从字节流恢复帧边界；CRC 校验和命令分发分别由上层任务完成。 */
 void ProtocolParser_Init(ProtocolParser_t *parser)
 {
     parser->current_state = WAIT_SOF;
@@ -13,6 +14,7 @@ bool ProtocolParser_InputByte(ProtocolParser_t* parser, uint8_t byte, ProtocolFr
     {
     case WAIT_SOF:
     {
+        /* SOF 之前的无关字节不会改变 Parser 状态。 */
         if (byte == 0xAA)
         {
             parser->success_count = 0U;
@@ -33,6 +35,7 @@ bool ProtocolParser_InputByte(ProtocolParser_t* parser, uint8_t byte, ProtocolFr
         }
         else if (byte == 0xAA)
         {
+            /* 非法 LEN 本身又是 SOF 时，把它作为下一候选帧的起点。 */
             parser->success_count = 0U;
             parser->current_state = READ_LEN;
         }
@@ -47,6 +50,7 @@ bool ProtocolParser_InputByte(ProtocolParser_t* parser, uint8_t byte, ProtocolFr
         parser->current_frame.cmd = byte;
         parser->success_count = 0U;
         
+        /* LEN 为 0 的帧没有 DATA，命令字节后直接接收 CRC。 */
         parser->current_state = (parser->current_frame.len == 0U) ? READ_CRC_H : READ_DATA;
     }
         break;
@@ -69,6 +73,7 @@ bool ProtocolParser_InputByte(ProtocolParser_t* parser, uint8_t byte, ProtocolFr
     case READ_CRC_L:
     {
         parser->current_frame.crc_lo = byte;
+        /* 输出接收值后立即复位，以便下一个输入字节可以开始新帧。 */
         *frame = parser->current_frame;
         parser->success_count = 0U;
         parser->current_state = WAIT_SOF;

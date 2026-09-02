@@ -1,3 +1,10 @@
+"""STM32 二进制串口协议的端到端验证工具。
+
+线上帧为 ``SOF | LEN | CMD | DATA | CRC_H | CRC_L``；CRC 覆盖
+``[LEN, CMD, DATA...]``。脚本负责构造请求、解析并校验响应，同时覆盖
+错误响应、静默丢弃和跨 UART 接收批次等边界场景。
+"""
+
 import sys
 import time
 from dataclasses import dataclass
@@ -38,27 +45,29 @@ GARBAGE_PREFIX = bytes([0x00, 0x55, 0xFF, 0x7E])
 
 
 class FrameReadError(RuntimeError):
-    """Base class for receive-side protocol failures."""
+    """接收侧协议错误的基类。"""
 
 
 class NoResponseTimeout(FrameReadError):
-    """No SOF was received before the overall deadline."""
+    """在整体截止时间前没有收到 SOF。"""
 
 
 class IncompleteFrame(FrameReadError):
-    """A frame started but was not completed before the overall deadline."""
+    """已经收到帧起点，但在整体截止时间前没有收齐。"""
 
 
 class InvalidFrameLength(FrameReadError):
-    """Only malformed frame candidates with invalid LEN were received."""
+    """已收到 LEN 越界候选，但截止时间内没有找到合法帧。"""
 
 
 class FrameCrcError(FrameReadError):
-    """A complete frame was received with a mismatching CRC."""
+    """帧结构完整，但接收 CRC 与本地计算结果不一致。"""
 
 
 @dataclass(frozen=True)
 class ReceivedFrame:
+    """CRC 校验通过的接收帧，以及解析该帧前跳过的前缀字节。"""
+
     raw: bytes
     length: int
     cmd: int
@@ -68,6 +77,8 @@ class ReceivedFrame:
 
 
 def crc16_ccitt_false(data: bytes) -> int:
+    """按非反射 CRC-16/CCITT-FALSE 计算输入字节序列的校验值。"""
+
     crc = 0xFFFF
     for byte in data:
         crc ^= byte << 8
@@ -80,6 +91,8 @@ def crc16_ccitt_false(data: bytes) -> int:
 
 
 def build_frame(cmd: int, data: bytes = b"") -> bytes:
+    """按线上格式组帧；CMD 必须为 1 byte，DATA 最多为 32 bytes。"""
+
     if not 0 <= cmd <= 0xFF:
         raise ValueError(f"CMD out of range: {cmd}")
     if len(data) > PROTOCOL_MAX_DATA_LEN:
@@ -93,6 +106,8 @@ def build_frame(cmd: int, data: bytes = b"") -> bytes:
 
 
 def read_exact(ser: serial.Serial, size: int, deadline: float, stage: str) -> bytes:
+    """在同一个整体 deadline 内读满 size bytes，并在返回前恢复串口 timeout。"""
+
     received = bytearray()
 
     while len(received) < size:
@@ -117,6 +132,12 @@ def read_exact(ser: serial.Serial, size: int, deadline: float, stage: str) -> by
 
 
 def read_frame(ser: serial.Serial, timeout_s: float = RESPONSE_TIMEOUT_S) -> ReceivedFrame:
+    """扫描并返回一个 CRC 正确的完整帧，所有字段共享同一个整体超时。
+
+    SOF 前的字节和 LEN 越界的候选会被跳过并记录；若最终仍未得到合法帧，
+    根据已经观察到的数据阶段抛出对应的 FrameReadError 子类。
+    """
+
     deadline = time.monotonic() + timeout_s
     discarded = bytearray()
     saw_any_byte = False
@@ -125,12 +146,14 @@ def read_frame(ser: serial.Serial, timeout_s: float = RESPONSE_TIMEOUT_S) -> Rec
     pending_sof = False
 
     while True:
+        # LEN 字节本身为 0xAA 时，把同一个字节复用为下一候选帧的 SOF。
         if pending_sof:
             marker = bytes([SOF])
             pending_sof = False
         else:
             remaining_time = deadline - time.monotonic()
             if remaining_time <= 0:
+                # 区分非法 LEN、残帧和完全无响应，便于定位链路停在哪个阶段。
                 if last_invalid_length is not None:
                     raise InvalidFrameLength(
                         f"no valid frame followed invalid LEN={last_invalid_length}; "
@@ -171,6 +194,7 @@ def read_frame(ser: serial.Serial, timeout_s: float = RESPONSE_TIMEOUT_S) -> Rec
 
         length = length_bytes[0]
         if length > PROTOCOL_MAX_DATA_LEN:
+            # 越界候选不再按其声明长度读取，继续在当前 deadline 内寻找下一帧。
             discarded.extend((SOF, length))
             last_invalid_length = length
             if length == SOF:
@@ -186,6 +210,7 @@ def read_frame(ser: serial.Serial, timeout_s: float = RESPONSE_TIMEOUT_S) -> Rec
         cmd = tail[0]
         data = tail[1 : 1 + length]
         received_crc = int.from_bytes(tail[-2:], "big")
+        # CRC 输入从 LEN 开始，到 DATA 结束；SOF 和接收 CRC 本身不参与计算。
         crc_input = length_bytes + tail[:-2]
         expected_crc = crc16_ccitt_false(crc_input)
         raw = bytes([SOF]) + length_bytes + tail
@@ -212,6 +237,8 @@ def read_buffered_input(ser: serial.Serial) -> bytes:
 
 
 def require_clean_input(ser: serial.Serial, context: str) -> None:
+    """确保当前用例开始前没有遗留响应，避免把旧帧误判为本次结果。"""
+
     pending = read_buffered_input(ser)
     if pending:
         raise AssertionError(
@@ -220,6 +247,8 @@ def require_clean_input(ser: serial.Serial, context: str) -> None:
 
 
 def write_all(ser: serial.Serial, data: bytes) -> None:
+    """写出完整请求并等待主机发送缓冲区排空；短写视为链路错误。"""
+
     written = ser.write(data)
     ser.flush()
     if written != len(data):
@@ -232,6 +261,8 @@ def assert_frame(
     expected_data: bytes,
     context: str,
 ) -> None:
+    """同时校验响应语义字段和重新组装后的完整原始帧。"""
+
     if frame.discarded_prefix:
         raise AssertionError(
             f"{context}: discarded unexpected response prefix "
@@ -266,6 +297,8 @@ def send_and_expect(
     expected_data: bytes,
     context: str,
 ) -> ReceivedFrame:
+    """执行一次无遗留输入的请求—响应交互，并校验预期帧。"""
+
     require_clean_input(ser, context)
     write_all(ser, request)
     response = read_frame(ser)
@@ -278,6 +311,8 @@ def assert_no_response(
     timeout_s: float,
     context: str,
 ) -> None:
+    """在指定时段内确认串口保持静默，任意接收字节都判为失败。"""
+
     deadline = time.monotonic() + timeout_s
     received = bytearray()
 
@@ -314,6 +349,8 @@ def run_case(
     action: Callable[[], None],
     failures: list[str],
 ) -> None:
+    """记录单个用例结果但继续执行后续用例，便于一次收集多个故障。"""
+
     try:
         action()
     except Exception as exc:
@@ -324,6 +361,8 @@ def run_case(
 
 
 def main() -> int:
+    """打开指定串口、按顺序执行验证，并在退出前尝试恢复 MODE_IDLE。"""
+
     if len(sys.argv) != 2:
         print(f"Usage: {sys.argv[0]} COMx")
         return 2
@@ -413,6 +452,7 @@ def main() -> int:
     def test_bad_crc_is_silent() -> None:
         require_clean_input(ser, "Bad CRC")
         bad_crc_frame = bytearray(build_frame(CMD_PING))
+        # 只翻转 CRC_L 的一位，保持帧结构和请求字段均合法。
         bad_crc_frame[-1] ^= 0x01
 
         for index in range(BAD_CRC_REPETITIONS):
@@ -426,6 +466,7 @@ def main() -> int:
     def test_half_packet() -> None:
         require_clean_input(ser, "Half Packet")
         request = build_frame(CMD_PING)
+        # 在 LEN 后暂停，验证 MCU Parser 能跨两个 DMA/IDLE 批次保留状态。
         split_at = 2
         write_all(ser, request[:split_at])
         time.sleep(HALF_PACKET_GAP_S)
@@ -458,6 +499,8 @@ def main() -> int:
         assert_frame(response, CMD_PING_RESP, b"", "Resynchronization")
 
     def cleanup_idle() -> None:
+        """清除残留输入后执行 SET/GET 闭环，尽量恢复可重复测试的初始状态。"""
+
         cleanup_issues = []
         pending = read_buffered_input(ser)
         if pending:
@@ -492,6 +535,7 @@ def main() -> int:
         if startup_bytes:
             print(f"[INFO] discarded startup input: {startup_bytes.hex(' ')}")
 
+        # 用例 3 建立 ACTIVE 状态，用例 4 随后验证非法参数不会改变该状态。
         run_case("1. PING", test_ping, failures)
         run_case("2. Initial GET_STATUS is IDLE", test_initial_status, failures)
         run_case("3. SET_MODE(ACTIVE) then GET_STATUS", test_set_active_and_get, failures)
@@ -512,6 +556,7 @@ def main() -> int:
             failures,
         )
     finally:
+        # 即使前面已有失败，也单独记录最终状态恢复结果并关闭串口。
         run_case("8. Restore IDLE", cleanup_idle, failures)
         ser.close()
 

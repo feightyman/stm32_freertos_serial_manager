@@ -1,3 +1,4 @@
+/* PC 侧集成测试：模拟一个协议帧被两个接收批次分割后经 Ring Buffer 送入 Parser。 */
 #include "ring_buffer.h"
 #include "protocol.h"
 #include <stdbool.h>
@@ -21,6 +22,7 @@ static void Check(bool condition, const char *name)
 
 static void TestCompleteSingleFrame(void)
 {
+    /* 第一批停在 DATA[0]，第二批补齐其余 DATA 和 CRC。 */
     static const uint8_t batch_1[] = {
         0xAAU, 0x03U, 0x10U, 0x11U
     };
@@ -52,6 +54,7 @@ static void TestCompleteSingleFrame(void)
             frame_count++;
         }
     }
+    /* 批次耗尽不应重置 Parser，未完成帧的状态必须保留。 */
     Check(frame_count == 0U, "frame count 0U");
     Check(RingBuffer_isEmpty(), "ringbuffer empty");
     Check(parser.current_state == READ_DATA, "parser state READ_DATA");

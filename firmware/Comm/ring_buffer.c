@@ -3,6 +3,7 @@
 #include <stdbool.h>
 #define CAPACITY 256
 
+/* head 指向下一写入位置，tail 指向下一读取位置，count 用于区分空与满。 */
 static uint8_t RingBuffer[CAPACITY];
 static volatile uint16_t head = 0U;
 static volatile uint16_t tail = 0U;
@@ -43,6 +44,7 @@ bool RingBuffer_Writer(uint8_t data)
     }
     RingBuffer[head] = data;
     head++;
+    /* 索引到达数组末尾后回绕，但不改变尚未读取的数据。 */
     head == CAPACITY ? head = 0 : head;
     count++;
     return true;
@@ -56,6 +58,7 @@ bool RingBuffer_Read(uint8_t* data)
     }
     *data = RingBuffer[tail];
     tail++;
+    /* 读索引与写索引使用相同的环形回绕规则。 */
     tail == CAPACITY ? tail = 0 : tail;
     count--;
     return true;

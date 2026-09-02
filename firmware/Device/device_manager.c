@@ -1,6 +1,7 @@
 #include "device_manager.h"
 
 
+/* 状态只保存在 RAM 中，由 DeviceTask 初始化并串行访问。 */
 static DeviceState_t state;
 void DeviceManager_Init(void)
 {

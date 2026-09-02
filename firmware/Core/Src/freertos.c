@@ -39,6 +39,7 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
+/* Receive-to-IDLE 每批最多接收 128 bytes，与 Normal DMA 的单次接收长度一致。 */
 #define UART_RX_DMA_BUFFER_SIZE 128U
 /* USER CODE END PD */
 
@@ -49,16 +50,23 @@
 
 /* Private variables ---------------------------------------------------------*/
 /* USER CODE BEGIN Variables */
+/* 仅用于调试器观察任务活性：DeviceTask 按取队列超时计数，CommTask 按接收批次计数。 */
 volatile uint32_t device_alive = 0;
 volatile uint32_t comm_alive = 0;
 
+/*
+ * DMA 直接写入 uart_rx_dma_buffer；HAL 回调发布有效长度和 ready 标志，CommTask 消费。
+ * volatile 仅让 ISR/任务的访问落到实际内存，不提供互斥、事件排队或多生产者同步。
+ */
 static uint8_t uart_rx_dma_buffer[UART_RX_DMA_BUFFER_SIZE];
 static volatile uint16_t uart_rx_length = 0U;
 static volatile uint8_t uart_rx_ready = 0U;
+/* 运行期诊断计数器只供本地观察，当前协议没有读取这些统计值的命令。 */
 volatile uint16_t ping_count = 0U;
 volatile uint16_t frame_count = 0U;
 volatile uint16_t crc_error_count = 0U;
 volatile uint16_t queue_drop_count = 0U;
+/* CommTask 生产完整且 CRC 正确的帧，DeviceTask 按值取走并负责业务处理。 */
 osMessageQueueId_t ProtocolQueueHandle;
 const osMessageQueueAttr_t ProtocolQueue_attributes = {
     .name = "ProtocolQueue"
@@ -81,6 +89,10 @@ const osThreadAttr_t CommTask_attributes = {
 
 /* Private function prototypes -----------------------------------------------*/
 /* USER CODE BEGIN FunctionPrototypes */
+/*
+ * Parser 只负责组帧，因此入队前在此校验 CRC。
+ * 计算范围为 [LEN, CMD, DATA...]，接收值按 CRC_H、CRC_L 组合。
+ */
 static bool ProtocolFrame_CrcOk(const ProtocolFrame_t* frame)
 {
   uint8_t crc_data[2U + PROTOCOL_MAX_DATA_LEN];
@@ -97,6 +109,7 @@ static bool ProtocolFrame_CrcOk(const ProtocolFrame_t* frame)
 
 static void DeviceTask_SendErrorResponse(uint8_t failed_cmd,uint8_t error_code)
 {
+  /* 错误响应固定为 AA 02 FF failed_cmd error_code CRC_H CRC_L。 */
   uint8_t resp[PROTOCOL_MAX_DATA_LEN];
   const uint8_t sof = 0xAAU;
   resp[0] = sof;
@@ -107,6 +120,7 @@ static void DeviceTask_SendErrorResponse(uint8_t failed_cmd,uint8_t error_code)
   uint16_t crc = CRC16_CCITT_FALSE_Calc(&resp[1], 4U);
   resp[5] = (uint8_t)(crc >> 8U);
   resp[6] = (uint8_t)(crc & 0xFFU);
+  /* 当前发送路径是阻塞式；超时或 HAL 错误统一进入 Error_Handler。 */
   if (HAL_UART_Transmit(&huart1, resp, 7U, 100U) != HAL_OK)
   {
     Error_Handler();
@@ -172,6 +186,7 @@ void MX_FREERTOS_Init(void) {
 
   /* USER CODE BEGIN RTOS_QUEUES */
   /* add queues, ... */
+  /* 队列按值复制 ProtocolFrame_t，避免两个任务共享 Parser 的输出对象。 */
   ProtocolQueueHandle = osMessageQueueNew(8, sizeof(ProtocolFrame_t), &ProtocolQueue_attributes);
   /* USER CODE END RTOS_QUEUES */
 
@@ -205,18 +220,21 @@ void StartDeviceTask(void *argument)
   ProtocolFrame_t frame = { 0 };
   uint8_t resp[PROTOCOL_MAX_DATA_LEN];
   const uint8_t sof = 0xAAU;
+  /* DeviceTask 是 DeviceManager 状态的唯一业务访问者，处理首帧前先复位为 IDLE。 */
   DeviceManager_Init();
   DeviceState_t current_state;
 
   /* Infinite loop */
   for(;;)
   {
+    /* 串行处理请求；1 s 取队列超时仅用于更新任务活性计数。 */
     if (osMessageQueueGet(ProtocolQueueHandle, &frame, NULL, 1000U) == osOK)
     {
       switch (frame.cmd)
       {
       case CMD_PING:
       {
+        /* 当前 PING 分支不检查请求 LEN，始终返回空 DATA 的 PING 响应。 */
         resp[0] = sof;
         resp[1] = 0U;
         resp[2] = CMD_PING_RESP;
@@ -259,6 +277,7 @@ void StartDeviceTask(void *argument)
           DeviceTask_SendErrorResponse(CMD_SET_MODE, ERR_INVALID_LENGTH);
           break;
         }
+        /* DeviceManager 只接受已定义模式；失败时不会改变原状态。 */
         if (DeviceManager_SetMode(frame.data[0]))
         {
           resp[0] = sof;
@@ -311,9 +330,11 @@ void StartCommTask(void *argument)
 
 
 
+  /* Ring Buffer 和 Parser 均由 CommTask 独占，状态可以安全地跨 DMA 批次保留。 */
   RingBuffer_Init();
   ProtocolParser_Init(&parser);
 
+  /* Normal DMA 在 IDLE 或传输完成后停止，因此每个批次都必须由任务重新启动。 */
   rx_status = HAL_UARTEx_ReceiveToIdle_DMA(
     &huart1,
     uart_rx_dma_buffer,
@@ -323,17 +344,20 @@ void StartCommTask(void *argument)
   {
     Error_Handler();
   }
+  /* 本实现按 IDLE/Transfer Complete 处理整批数据，不消费 Half Transfer 事件。 */
   __HAL_DMA_DISABLE_IT(huart1.hdmarx,DMA_IT_HT);
   /* Infinite loop */
   for(;;)
   {
     if (uart_rx_ready != 0U)
     {
+      /* 先快照回调发布的长度，再把 DMA 缓冲区内容复制到任务私有的 Ring Buffer。 */
       echo_length = uart_rx_length;
       for (uint8_t i = 0U; i < echo_length; i++)
       {
         if (!RingBuffer_Writer(uart_rx_dma_buffer[i]))
         {
+          /* 写满时停止复制，本批次尚未写入的字节不会进入 Parser。 */
           break;
         }
         write_count++;
@@ -342,6 +366,7 @@ void StartCommTask(void *argument)
       uart_rx_ready = 0U;
       uart_rx_length = 0U;
 
+      /* 复制完成后先重启接收，再解析 Ring Buffer 中与 DMA 存储区解耦的数据。 */
       rx_status = HAL_UARTEx_ReceiveToIdle_DMA(
         &huart1,
         uart_rx_dma_buffer,
@@ -353,12 +378,14 @@ void StartCommTask(void *argument)
       }
       __HAL_DMA_DISABLE_IT(huart1.hdmarx, DMA_IT_HT);
 
+      /* 只读取本批实际成功写入 Ring Buffer 的字节数。 */
       for (uint8_t i = 0U; i < write_count; i++)
       {
         if (RingBuffer_Read(&byte))
         {
           if (ProtocolParser_InputByte(&parser, byte, &frame))
           {
+            /* 完整帧先校验 CRC，再以零等待方式入队；队列满时只记录丢帧。 */
             if (ProtocolFrame_CrcOk(&frame))
             {
               if (osMessageQueuePut(ProtocolQueueHandle, &frame, 0U, 0U) == osOK)
@@ -388,6 +415,10 @@ void StartCommTask(void *argument)
 
 /* Private application code --------------------------------------------------*/
 /* USER CODE BEGIN Application */
+/*
+ * HAL UART 回调运行在中断上下文，只发布本批次长度和 ready 标志。
+ * 数据复制、DMA 重启、Parser 和 RTOS Queue 操作全部留在 CommTask 中执行。
+ */
 void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef* huart, uint16_t Size)
 {
   if (huart->Instance == USART1)
